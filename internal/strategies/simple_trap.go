@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -541,20 +542,48 @@ func (b *SimpleTrap) handleUserFill(ctx context.Context, data any) {
 	b.processedMatchIds[matchID] = struct{}{}
 	b.mu.Unlock()
 
+	orderID := fmt.Sprint(firstAny(m, "order_id", "orderId"))
 	assetID := fmt.Sprint(firstAny(m, "asset_id", "token_id"))
+	side := strings.ToUpper(fmt.Sprint(m["side"])) // BUY/SELL
 	price := parseFloat(fmt.Sprint(m["price"]))
 	size := parseFloat(fmt.Sprint(firstAny(m, "size", "amount")))
 	if assetID == "" || price <= 0 || size <= 0 {
 		return
 	}
-
-	if assetID == b.tokenIdYes || assetID == b.tokenIdNo {
-		side := "YES"
-		if assetID == b.tokenIdNo {
-			side = "NO"
-		}
-		_ = b.handleOrderFilled(ctx, matchID, side, "TRAP", price, size) // mirrors TS simplification
+	// only care about BUY fills for this strategy
+	if side != "BUY" {
+		return
 	}
+
+	// Same de-dupe trick as SniperLadder: advance per-order accounted matched.
+	if orderID != "" {
+		b.mu.Lock()
+		b.orderFillHistory[orderID] += size
+		b.mu.Unlock()
+	}
+
+	if assetID != b.tokenIdYes && assetID != b.tokenIdNo {
+		return
+	}
+	tokenSide := "YES"
+	if assetID == b.tokenIdNo {
+		tokenSide = "NO"
+	}
+
+	// Determine order type if we still track it.
+	typ := "TRAP"
+	if orderID != "" {
+		b.mu.Lock()
+		if info, ok := b.activeOrders[orderID]; ok && info.typ != "" {
+			typ = info.typ
+		}
+		b.mu.Unlock()
+	}
+	id := orderID
+	if id == "" {
+		id = matchID
+	}
+	_ = b.handleOrderFilled(ctx, id, tokenSide, typ, price, size)
 }
 
 func (b *SimpleTrap) handleOrderFilled(ctx context.Context, orderID string, side string, typ string, fillPrice float64, filledSize float64) error {

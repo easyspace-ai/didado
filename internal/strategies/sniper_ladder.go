@@ -522,8 +522,17 @@ func (b *SniperLadder) handleUserFill(ctx context.Context, data any) {
 	size := parseFloat(fmt.Sprint(m["size"]))
 	price := parseFloat(fmt.Sprint(m["price"]))
 	asset := fmt.Sprint(m["asset_id"])
+	orderID := fmt.Sprint(firstAny(m, "order_id", "orderId"))
 	if size == 0 || price == 0 {
 		return
+	}
+
+	// Critical: WS fills must advance per-order "already accounted" matched amount,
+	// otherwise polling-based fill detection will double-count.
+	if orderID != "" {
+		b.mu.Lock()
+		b.orderFillHistory[orderID] += size
+		b.mu.Unlock()
 	}
 	services.DashboardManager.Log(fmt.Sprintf("⚡ FILL CONFIRMED: %s %.4g @ %.4f", side, size, price), services.LogTrade)
 

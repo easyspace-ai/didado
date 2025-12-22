@@ -9,6 +9,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -172,22 +173,39 @@ func (c *TokenClaimer) CheckAndClaim(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 
-	conditionIDs := map[string]struct{}{}
+	// conditionId -> indexSet(s)
+	conditionIndexSets := map[string]map[string]struct{}{}
 	for _, p := range positions {
 		if cid, _ := p["conditionId"].(string); cid != "" {
-			conditionIDs[cid] = struct{}{}
+			if _, ok := conditionIndexSets[cid]; !ok {
+				conditionIndexSets[cid] = map[string]struct{}{}
+			}
+			for _, s := range extractIndexSets(p) {
+				conditionIndexSets[cid][s] = struct{}{}
+			}
 		}
 	}
-	if len(conditionIDs) == 0 {
+	if len(conditionIndexSets) == 0 {
 		return 0, nil
 	}
 
 	DashboardManager.Log(fmt.Sprintf("[CLAIMER] 💰 Found %d redeemable position(s)", len(positions)), LogInfo)
-	DashboardManager.Log(fmt.Sprintf("[CLAIMER] 🔗 Redeeming %d condition(s)...", len(conditionIDs)), LogInfo)
+	DashboardManager.Log(fmt.Sprintf("[CLAIMER] 🔗 Redeeming %d condition(s)...", len(conditionIndexSets)), LogInfo)
 
 	success := 0
-	for cid := range conditionIDs {
-		err := c.redeemCondition(ctx, cid)
+	for cid, setStrs := range conditionIndexSets {
+		indexSets := make([]*big.Int, 0, len(setStrs))
+		for s := range setStrs {
+			if bi, ok := parseBigIntLoose(s); ok && bi.Sign() >= 0 {
+				indexSets = append(indexSets, bi)
+			}
+		}
+		// Backwards-compatible fallback (previous behavior)
+		if len(indexSets) == 0 {
+			indexSets = []*big.Int{big.NewInt(1), big.NewInt(2)}
+		}
+
+		err := c.redeemCondition(ctx, cid, indexSets)
 		if err != nil {
 			DashboardManager.Log(fmt.Sprintf("[CLAIMER] ❌ Error redeeming condition %s...: %s", trim10(cid), err.Error()), LogError)
 			continue
@@ -195,12 +213,12 @@ func (c *TokenClaimer) CheckAndClaim(ctx context.Context) (int, error) {
 		success++
 	}
 	if success > 0 {
-		DashboardManager.Log(fmt.Sprintf("[CLAIMER] ✅ Successfully redeemed %d/%d condition(s)", success, len(conditionIDs)), LogInfo)
+		DashboardManager.Log(fmt.Sprintf("[CLAIMER] ✅ Successfully redeemed %d/%d condition(s)", success, len(conditionIndexSets)), LogInfo)
 	}
 	return success, nil
 }
 
-func (c *TokenClaimer) redeemCondition(ctx context.Context, conditionID string) error {
+func (c *TokenClaimer) redeemCondition(ctx context.Context, conditionID string, indexSets []*big.Int) error {
 	formatted := conditionID
 	if !strings.HasPrefix(formatted, "0x") {
 		formatted = "0x" + formatted
@@ -221,7 +239,7 @@ func (c *TokenClaimer) redeemCondition(ctx context.Context, conditionID string) 
 		common.HexToAddress("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
 		parent,
 		cond,
-		[]*big.Int{big.NewInt(1), big.NewInt(2)},
+		indexSets,
 	)
 	if err != nil {
 		return err
@@ -252,4 +270,53 @@ func trim10(s string) string {
 		return s
 	}
 	return string(rs[:10])
+}
+
+func extractIndexSets(p map[string]any) []string {
+	// Data API variants: indexSet, index_set, indexSets
+	var out []string
+	for _, k := range []string{"indexSet", "index_set", "indexSets"} {
+		v, ok := p[k]
+		if !ok || v == nil {
+			continue
+		}
+		switch t := v.(type) {
+		case string:
+			if strings.TrimSpace(t) != "" {
+				out = append(out, strings.TrimSpace(t))
+			}
+		case float64:
+			out = append(out, fmt.Sprintf("%.0f", t))
+		case []any:
+			for _, it := range t {
+				switch x := it.(type) {
+				case string:
+					if strings.TrimSpace(x) != "" {
+						out = append(out, strings.TrimSpace(x))
+					}
+				case float64:
+					out = append(out, fmt.Sprintf("%.0f", x))
+				}
+			}
+		}
+	}
+	return out
+}
+
+func parseBigIntLoose(s string) (*big.Int, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, false
+	}
+	// allow hex "0x.." or decimal
+	i := new(big.Int)
+	if _, ok := i.SetString(s, 0); ok {
+		return i, true
+	}
+	// sometimes comes as floatish string
+	if f, err := strconv.ParseFloat(s, 64); err == nil {
+		i.SetInt64(int64(f))
+		return i, true
+	}
+	return nil, false
 }
