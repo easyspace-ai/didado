@@ -14,21 +14,22 @@ import (
 	"github.com/ethereum/go-ethereum/ethclient"
 )
 
-// ClobClient CLOB 客户端接口 (需要实现)
+// ClobClient CLOB 客户端接口
+// 注意：这个接口应该由 clob.ClobClient 实现
 type ClobClient interface {
 	CreateOrder(order OrderRequest) (*Order, error)
 	PostOrder(order *Order, orderType string) (*OrderResponse, error)
-	CancelOrder(req CancelOrderRequest) error
+	CancelOrder(orderID string) error
 	CancelAll() error
 	GetOrder(orderID string) (*OrderInfo, error)
 }
 
 // OrderRequest 订单请求
 type OrderRequest struct {
-	TokenID  string
-	Price    float64
-	Side     string
-	Size     float64
+	TokenID    string
+	Price      float64
+	Side       string
+	Size       float64
 	FeeRateBps int
 }
 
@@ -42,26 +43,26 @@ type Order struct {
 
 // OrderResponse 订单响应
 type OrderResponse struct {
-	OrderID string `json:"orderID"`
-	OrderId string `json:"orderId"`
-	ID      string `json:"id"`
-	Success bool   `json:"success"`
-	Error   string `json:"error"`
+	OrderID  string `json:"orderID"`
+	OrderId  string `json:"orderId"`
+	ID       string `json:"id"`
+	Success  bool   `json:"success"`
+	Error    string `json:"error"`
 	ErrorMsg string `json:"errorMsg"`
 }
 
-// CancelOrderRequest 取消订单请求
-type CancelOrderRequest struct {
-	OrderID string
-}
 
 // OrderInfo 订单信息
 type OrderInfo struct {
-	SizeMatched     string `json:"size_matched"`
-	SizeMatchedAlt  string `json:"sizeMatched"`
-	Status          string `json:"status"`
-	Canceled        bool   `json:"canceled"`
-	Price           string `json:"price"`
+	OrderID         string  `json:"orderID"`
+	TokenID         string  `json:"token_id"`
+	Price           string  `json:"price"`
+	Size            string  `json:"size"`
+	SizeMatched     string  `json:"size_matched"`
+	SizeMatchedAlt  string  `json:"sizeMatched"`
+	Status          string  `json:"status"`
+	Canceled        bool    `json:"canceled"`
+	Side            string  `json:"side"`
 	AssociateTrades []Trade `json:"associate_trades"`
 }
 
@@ -80,6 +81,23 @@ type LiveExecutor struct {
 	provider      *ethclient.Client
 	ctfContract   *bind.BoundContract
 	mu            sync.RWMutex
+}
+
+// NewLiveExecutorWithClient 使用已存在的 CLOB 客户端创建执行器
+func NewLiveExecutorWithClient(client ClobClient, signer *bind.TransactOpts, funderAddress common.Address) (*LiveExecutor, error) {
+	provider, err := ethclient.Dial(POLYGON_RPC)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to Polygon RPC: %w", err)
+	}
+
+	fmt.Println("🚨 LIVE TRADING MODE ACTIVE 🚨")
+
+	return &LiveExecutor{
+		client:        client,
+		signer:        signer,
+		funderAddress: funderAddress,
+		provider:      provider,
+	}, nil
 }
 
 const (
@@ -156,23 +174,26 @@ func (l *LiveExecutor) PlaceOrder(params TradeParams) (string, error) {
 		orderType = params.Type
 	}
 
-	side := "BUY"
-	if params.Side == "SELL" {
-		side = "SELL"
+	// 订单类型转换
+	orderTypeStr := orderType
+	if orderTypeStr == "" {
+		orderTypeStr = "GTC"
 	}
 
-	order, err := l.client.CreateOrder(OrderRequest{
+	orderReq := OrderRequest{
 		TokenID:    params.TokenID,
 		Price:      params.Price,
-		Side:       side,
+		Side:       params.Side,
 		Size:       params.Size,
 		FeeRateBps: 0,
-	})
+	}
+
+	order, err := l.client.CreateOrder(orderReq)
 	if err != nil {
 		return "", fmt.Errorf("failed to create order: %w", err)
 	}
 
-	response, err := l.client.PostOrder(order, orderType)
+	response, err := l.client.PostOrder(order, orderTypeStr)
 	if err != nil {
 		return "", fmt.Errorf("failed to post order: %w", err)
 	}
@@ -216,7 +237,7 @@ func (l *LiveExecutor) CancelAll() error {
 // CancelOrder 取消指定订单
 func (l *LiveExecutor) CancelOrder(orderID string) error {
 	for i := 0; i < 3; i++ {
-		err := l.client.CancelOrder(CancelOrderRequest{OrderID: orderID})
+		err := l.client.CancelOrder(orderID)
 		if err == nil {
 			fmt.Printf("✅ Order %s cancelled.\n", orderID)
 			return nil

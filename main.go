@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"fmt"
 	"math/big"
 	"os"
@@ -14,8 +15,8 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/joho/godotenv"
-	"crypto/ecdsa"
 
+	"polymarketbot-go/src/clob"
 	"polymarketbot-go/src/core"
 	"polymarketbot-go/src/execution"
 	"polymarketbot-go/src/services"
@@ -85,6 +86,11 @@ func main() {
 	}
 
 	isProxy := proxyAddressStr != ""
+	signatureType := 0
+	if isProxy {
+		signatureType = 1
+	}
+
 	fmt.Println("🔐 Authenticating with CLOB...")
 	if isProxy {
 		fmt.Printf("   Signature Type: 1 (Proxy/Web)\n")
@@ -97,28 +103,95 @@ func main() {
 
 	fmt.Println("   ⏳ Deriving API key (this may take 10-30 seconds)...")
 
-	// 这里需要实现实际的 API key 派生逻辑
-	// 简化实现：从环境变量读取
+	// 创建签名器
+	chainID := big.NewInt(CHAIN_ID)
+	auth, err := bind.NewKeyedTransactorWithChainID(privateKey, chainID)
+	if err != nil {
+		fmt.Printf("❌ Failed to create transactor: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 创建初始 CLOB 客户端 (无凭证)
+	clobClient := clob.NewClobClientWithPrivateKey(
+		"https://clob.polymarket.com",
+		CHAIN_ID,
+		privateKey,
+		nil, // creds (将通过 deriveApiKey 派生)
+		signatureType,
+		proxyAddress,
+	)
+
+	// 尝试从环境变量读取凭证
 	apiKey := os.Getenv("POLYMARKET_API_KEY")
 	apiSecret := os.Getenv("POLYMARKET_API_SECRET")
-	apiPassphrase := os.Getenv("POLYMARKET_API_PASSPHRASE")
+	apiPassphrase := os.Getenv("POLYMARKET_PASSPHRASE")
 
-	if apiKey == "" || apiSecret == "" {
-		fmt.Println("⚠️ API credentials not found. Bot will work but some features may be limited.")
-		fmt.Println("   Set POLYMARKET_API_KEY, POLYMARKET_API_SECRET, and POLYMARKET_API_PASSPHRASE in .env")
+	var creds *clob.Credentials
+	var wsCreds *services.UserCredentials
+
+	if apiKey != "" && apiSecret != "" {
+		// 使用环境变量中的凭证
+		creds = &clob.Credentials{
+			Key:        apiKey,
+			Secret:     apiSecret,
+			Passphrase: apiPassphrase,
+		}
+		clobClient.SetCredentials(creds)
+		fmt.Println("✅ Using API credentials from environment variables.")
+	} else {
+		// 派生 API 密钥
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+
+		done := make(chan error, 1)
+		go func() {
+			derivedCreds, err := clobClient.DeriveApiKey()
+			if err != nil {
+				done <- err
+				return
+			}
+			creds = derivedCreds
+			done <- nil
+		}()
+
+		select {
+		case err := <-done:
+			if err != nil {
+				fmt.Printf("❌ Authentication Failed: %v\n", err)
+				fmt.Println("   Make sure you've enabled trading on polymarket.com with this wallet.")
+				os.Exit(1)
+			}
+			fmt.Println("✅ API Key Derived Successfully.")
+		case <-ctx.Done():
+			fmt.Println("❌ Authentication timeout after 60 seconds")
+			os.Exit(1)
+		}
+
+		// 重新创建客户端，使用派生凭证
+		clobClient = clob.NewClobClientWithPrivateKey(
+			"https://clob.polymarket.com",
+			CHAIN_ID,
+			privateKey,
+			creds,
+			signatureType,
+			proxyAddress,
+		)
+		fmt.Println("   ✅ Client re-initialized with derived credentials.")
+		fmt.Printf("   (Debug) Signer Address: %s\n", address.Hex())
+		fmt.Printf("   (Debug) Configured Funder: %s\n", proxyAddress.Hex())
+		fmt.Printf("   (Debug) Signature Type: %d\n", signatureType)
 	}
 
-	creds := &services.UserCredentials{
-		Key:        apiKey,
-		Secret:     apiSecret,
-		Passphrase: apiPassphrase,
+	// 转换为服务层使用的凭证格式
+	wsCreds = &services.UserCredentials{
+		Key:        creds.Key,
+		Secret:     creds.Secret,
+		Passphrase: creds.Passphrase,
 	}
-
-	fmt.Println("✅ API Key Derived Successfully.")
 
 	// 步骤 3: 初始化服务
 	polyService := services.NewPolymarketService()
-	wsService := services.NewWebSocketService(nil) // 需要实现 ClobClient
+	wsService := services.NewWebSocketService(clobClient)
 
 	// 步骤 4: 选择执行器 (Paper vs Live)
 	isLiveTrading := os.Getenv("LIVE_TRADING") == "true"
@@ -128,18 +201,9 @@ func main() {
 	if isLiveTrading {
 		fmt.Println("🚨 MODE: LIVE TRADING (REAL FUNDS) 🚨")
 
-		// 创建签名器
-		chainID := big.NewInt(CHAIN_ID)
-		auth, err := bind.NewKeyedTransactorWithChainID(privateKey, chainID)
-		if err != nil {
-			fmt.Printf("❌ Failed to create transactor: %v\n", err)
-			os.Exit(1)
-		}
-
-		// 创建 CLOB 客户端 (需要实现)
-		clobClient := &MockClobClient{} // 占位符
-
-		executor, err = execution.NewLiveExecutor(clobClient, auth, proxyAddress)
+		// 使用包装器包装 ClobClient (clobClient 实现了 ClobClientWrapperInterface)
+		clobWrapper := execution.NewClobClientWrapper(clobClient)
+		executor, err = execution.NewLiveExecutorWithClient(clobWrapper, auth, proxyAddress)
 		if err != nil {
 			fmt.Printf("❌ Failed to create LiveExecutor: %v\n", err)
 			os.Exit(1)
@@ -156,8 +220,8 @@ func main() {
 		polyService,
 		wsService,
 		executor,
-		creds,
-		nil, // signer (需要实现)
+		wsCreds,
+		auth, // signer
 		proxyAddress.Hex(),
 		marketMath,
 	)
@@ -169,7 +233,7 @@ func main() {
 	go func() {
 		sig := <-sigChan
 		fmt.Printf("\n🛑 Received %v. Shutting down gracefully...\n", sig)
-		
+
 		if err := sniperBot.Stop(); err != nil {
 			fmt.Printf("❌ Error during shutdown: %v\n", err)
 			// 回退：尝试直接取消订单
@@ -178,7 +242,7 @@ func main() {
 		} else {
 			fmt.Println("✅ Bot stopped gracefully.")
 		}
-		
+
 		os.Exit(0)
 	}()
 
@@ -193,35 +257,4 @@ func main() {
 
 	// 保持进程运行
 	select {}
-}
-
-// MockClobClient 模拟 CLOB 客户端 (需要实现实际的客户端)
-type MockClobClient struct{}
-
-func (m *MockClobClient) CreateOrder(order execution.OrderRequest) (*execution.Order, error) {
-	return &execution.Order{
-		TokenID: order.TokenID,
-		Price:   order.Price,
-		Side:    order.Side,
-		Size:    order.Size,
-	}, nil
-}
-
-func (m *MockClobClient) PostOrder(order *execution.Order, orderType string) (*execution.OrderResponse, error) {
-	return &execution.OrderResponse{
-		OrderID: fmt.Sprintf("order-%d", time.Now().Unix()),
-		Success: true,
-	}, nil
-}
-
-func (m *MockClobClient) CancelOrder(req execution.CancelOrderRequest) error {
-	return nil
-}
-
-func (m *MockClobClient) CancelAll() error {
-	return nil
-}
-
-func (m *MockClobClient) GetOrder(orderID string) (*execution.OrderInfo, error) {
-	return &execution.OrderInfo{}, nil
 }

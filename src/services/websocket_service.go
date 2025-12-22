@@ -15,7 +15,7 @@ import (
 // WebSocketService WebSocket 服务
 // 管理到 Polymarket 的 WebSocket 连接以获取实时数据
 type WebSocketService struct {
-	client          interface{} // ClobClient 接口 (需要实现)
+	client          ClobClientInterface // ClobClient 接口
 	marketWS        *websocket.Conn
 	userWS          *websocket.Conn
 	activeTokenIds  []string
@@ -39,8 +39,13 @@ const (
 	userWSURL   = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
 )
 
+// ClobClientInterface CLOB 客户端接口 (用于 WebSocket 服务)
+type ClobClientInterface interface {
+	GetCredentials() interface{}
+}
+
 // NewWebSocketService 创建新的 WebSocket 服务
-func NewWebSocketService(client interface{}) *WebSocketService {
+func NewWebSocketService(client ClobClientInterface) *WebSocketService {
 	return &WebSocketService{
 		client:              client,
 		maxReconnectAttempts: 10,
