@@ -96,6 +96,10 @@ func Run(ctx context.Context, cfg config.Config) error {
 		s := strategies.NewSimpleTrap(api, ws, ex)
 		strat = s
 		done = s.Done()
+	case config.StrategyGridHedge:
+		s := strategies.NewGridHedge(api, ws, ex)
+		strat = s
+		done = s.Done()
 	default:
 		s := strategies.NewSniperLadder(api, ws, ex, claimer)
 		strat = s
@@ -113,6 +117,8 @@ func Run(ctx context.Context, cfg config.Config) error {
 		case *strategies.SniperLadder:
 			ws.SubscribeUser(userCreds, func(v any) { s.HandleUserWS(ctx, v) })
 		case *strategies.SimpleTrap:
+			ws.SubscribeUser(userCreds, func(v any) { s.HandleUserWS(ctx, v) })
+		case *strategies.GridHedge:
 			ws.SubscribeUser(userCreds, func(v any) { s.HandleUserWS(ctx, v) })
 		default:
 			// ignore
