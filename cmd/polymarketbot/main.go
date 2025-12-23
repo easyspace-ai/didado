@@ -14,7 +14,7 @@ import (
 
 func main() {
 	var (
-		strategy = flag.String("strategy", "", "策略: sniperladder 或 simpletrap（空=默认sniperladder）")
+		strategy = flag.String("strategy", "", "策略: sniperladder / simpletrap / gridhedge（空=默认sniperladder）")
 	)
 	flag.Parse()
 

@@ -14,6 +14,7 @@ type Strategy string
 const (
 	StrategySniperLadder Strategy = "sniperladder"
 	StrategySimpleTrap   Strategy = "simpletrap"
+	StrategyGridHedge    Strategy = "gridhedge"
 )
 
 type LoadOptions struct {
@@ -78,8 +79,10 @@ func Load(opts LoadOptions) (Config, error) {
 			cfg.Strategy = StrategySniperLadder
 		case string(StrategySimpleTrap):
 			cfg.Strategy = StrategySimpleTrap
+		case string(StrategyGridHedge):
+			cfg.Strategy = StrategyGridHedge
 		default:
-			return Config{}, fmt.Errorf("未知策略: %q（支持 sniperladder/simpletrap）", s)
+			return Config{}, fmt.Errorf("未知策略: %q（支持 sniperladder/simpletrap/gridhedge）", s)
 		}
 	}
 
