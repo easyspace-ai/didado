@@ -17,7 +17,7 @@ import (
 )
 
 // GridHedge:
-// - 监听某一侧（默认 YES）的价格
+// - 同时监听 YES 与 NO 的价格
 // - 当价格从下向上穿越用户定义网格价时，发送“市价”买入（FOK，价格=0.99）
 // - 买入后立即挂另一侧（NO）的对冲买单，用于锁定利润（双向持仓）
 //
@@ -33,7 +33,7 @@ type GridHedge struct {
 	isRunning bool
 
 	// --- CONFIG ---
-	tradeSide             string // "YES" or "NO" (默认 YES)
+	tradeSides            map[string]bool // {"YES":true,"NO":true}
 	gridLevels            []float64
 	entrySize             float64
 	profitLock            float64 // 每对锁定的最低利润（美元），对冲单会按 1-entryPrice-profitLock 挂买价
@@ -50,8 +50,10 @@ type GridHedge struct {
 	priceYes   float64
 	priceNo    float64
 
-	lastPrice float64
-	triggered map[float64]struct{} // level -> triggered
+	lastPriceYes float64
+	lastPriceNo  float64
+	triggeredYes map[float64]struct{} // level -> triggered
+	triggeredNo  map[float64]struct{} // level -> triggered
 
 	activeOrders map[string]struct {
 		side  string // YES|NO
@@ -84,14 +86,15 @@ func NewGridHedge(api *services.PolymarketService, ws *services.WebSocketService
 		ws:       ws,
 		executor: ex,
 
-		tradeSide:         "YES",
+		tradeSides:        map[string]bool{"YES": true, "NO": true},
 		gridLevels:        []float64{0.62, 0.67, 0.72},
 		entrySize:         5,
 		profitLock:        0.01,
 		marketBuyMaxPrice: 0.99,
 		oneCycleOnly:      false,
 
-		triggered: map[float64]struct{}{},
+		triggeredYes: map[float64]struct{}{},
+		triggeredNo:  map[float64]struct{}{},
 		activeOrders: map[string]struct {
 			side, typ   string
 			price, size float64
@@ -121,12 +124,9 @@ func NewGridHedge(api *services.PolymarketService, ws *services.WebSocketService
 			b.profitLock = v
 		}
 	}
-	// GRID_TRADE_SIDE=YES|NO
+	// GRID_TRADE_SIDE=YES|NO|BOTH (默认 BOTH)
 	if s := strings.TrimSpace(os.Getenv("GRID_TRADE_SIDE")); s != "" {
-		u := strings.ToUpper(s)
-		if u == "YES" || u == "NO" {
-			b.tradeSide = u
-		}
+		b.tradeSides = parseTradeSides(s)
 	}
 	// GRID_ONE_CYCLE_ONLY=true|false
 	if strings.TrimSpace(os.Getenv("GRID_ONE_CYCLE_ONLY")) == "true" {
@@ -152,7 +152,16 @@ func (b *GridHedge) Start(ctx context.Context) error {
 	b.mu.Unlock()
 
 	services.DashboardManager.Log("🚀 GRID HEDGE 策略启动", services.LogInfo)
-	services.DashboardManager.Log(fmt.Sprintf("   触发侧=%s, 网格=%v, 每次买入=%.4g, 锁利=%.3f", b.tradeSide, b.gridLevels, b.entrySize, b.profitLock), services.LogInfo)
+	b.mu.Lock()
+	sides := make([]string, 0, 2)
+	if b.tradeSides["YES"] {
+		sides = append(sides, "YES")
+	}
+	if b.tradeSides["NO"] {
+		sides = append(sides, "NO")
+	}
+	b.mu.Unlock()
+	services.DashboardManager.Log(fmt.Sprintf("   触发侧=%s, 网格=%v, 每次买入=%.4g, 锁利=%.3f", strings.Join(sides, "+"), b.gridLevels, b.entrySize, b.profitLock), services.LogInfo)
 
 	b.healthTicker = time.NewTicker(15 * time.Second)
 	b.syncTicker = time.NewTicker(30 * time.Second)
@@ -267,8 +276,10 @@ func (b *GridHedge) runLifecycle(ctx context.Context) error {
 	}
 	b.mu.Lock()
 	b.tokenIdYes, b.tokenIdNo = tokenIDs[0], tokenIDs[1]
-	b.lastPrice = 0
-	b.triggered = map[float64]struct{}{}
+	b.lastPriceYes = 0
+	b.lastPriceNo = 0
+	b.triggeredYes = map[float64]struct{}{}
+	b.triggeredNo = map[float64]struct{}{}
 	b.mu.Unlock()
 
 	// 订阅市场行情
@@ -313,8 +324,10 @@ func (b *GridHedge) endCycleAndRestart(ctx context.Context) error {
 func (b *GridHedge) resetState() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.lastPrice = 0
-	b.triggered = map[float64]struct{}{}
+	b.lastPriceYes = 0
+	b.lastPriceNo = 0
+	b.triggeredYes = map[float64]struct{}{}
+	b.triggeredNo = map[float64]struct{}{}
 	b.activeOrders = map[string]struct {
 		side, typ   string
 		price, size float64
@@ -344,7 +357,7 @@ func (b *GridHedge) handleMarketTick(ctx context.Context, data any) error {
 		b.mu.Unlock()
 	}()
 
-	b.updatePrices(data)
+	assetID, askPrice := b.updatePrices(data)
 
 	// 异常：长时间没价格
 	b.mu.Lock()
@@ -361,49 +374,77 @@ func (b *GridHedge) handleMarketTick(ctx context.Context, data any) error {
 	} else {
 		b.zeroDataStreak = 0
 	}
-	tradeSide := b.tradeSide
-	priceYes, priceNo := b.priceYes, b.priceNo
-	prev := b.lastPrice
+	yesID, noID := b.tokenIdYes, b.tokenIdNo
+	prevYes, prevNo := b.lastPriceYes, b.lastPriceNo
+	enabledYes, enabledNo := b.tradeSides["YES"], b.tradeSides["NO"]
 	b.mu.Unlock()
 
 	_ = b.checkFills(ctx)
 
-	current := priceYes
-	if tradeSide == "NO" {
-		current = priceNo
-	}
-	if current <= 0 {
+	// 只在收到某一侧的 tick 时，检查该侧上穿（更稳定，避免同一 tick 同时触发两侧）
+	if assetID == "" || askPrice <= 0 {
 		return nil
 	}
 
-	// 首次初始化 lastPrice
+	var side string
+	var prev float64
+	if assetID == yesID {
+		side = "YES"
+		prev = prevYes
+	} else if assetID == noID {
+		side = "NO"
+		prev = prevNo
+	} else {
+		return nil
+	}
+	if side == "YES" && !enabledYes {
+		return nil
+	}
+	if side == "NO" && !enabledNo {
+		return nil
+	}
+
+	// 首次初始化该侧 lastPrice
 	if prev <= 0 {
 		b.mu.Lock()
-		b.lastPrice = current
+		if side == "YES" {
+			b.lastPriceYes = askPrice
+		} else {
+			b.lastPriceNo = askPrice
+		}
 		b.mu.Unlock()
 		b.updateDashboard()
 		return nil
 	}
 
 	// 检测“上穿”网格价
-	level := b.detectCrossUp(prev, current)
+	level := b.detectCrossUp(side, prev, askPrice)
 	if level > 0 {
-		services.DashboardManager.Log(fmt.Sprintf("📈 上穿网格 %.2f（%.4f -> %.4f），触发买入", level, prev, current), services.LogTrade)
-		_ = b.onCrossUp(ctx, level)
+		services.DashboardManager.Log(fmt.Sprintf("📈 %s 上穿网格 %.2f（%.4f -> %.4f），触发买入", side, level, prev, askPrice), services.LogTrade)
+		_ = b.onCrossUp(ctx, side, level, askPrice)
 	}
 
 	b.mu.Lock()
-	b.lastPrice = current
+	if side == "YES" {
+		b.lastPriceYes = askPrice
+	} else {
+		b.lastPriceNo = askPrice
+	}
 	b.mu.Unlock()
 
 	b.updateDashboard()
 	return nil
 }
 
-func (b *GridHedge) detectCrossUp(prev, cur float64) float64 {
+func (b *GridHedge) detectCrossUp(side string, prev, cur float64) float64 {
 	b.mu.Lock()
 	levels := append([]float64(nil), b.gridLevels...)
-	triggered := b.triggered
+	var triggered map[float64]struct{}
+	if side == "NO" {
+		triggered = b.triggeredNo
+	} else {
+		triggered = b.triggeredYes
+	}
 	b.mu.Unlock()
 
 	for _, lvl := range levels {
@@ -418,18 +459,22 @@ func (b *GridHedge) detectCrossUp(prev, cur float64) float64 {
 	return 0
 }
 
-func (b *GridHedge) onCrossUp(ctx context.Context, level float64) error {
+func (b *GridHedge) onCrossUp(ctx context.Context, tradeSide string, level float64, entryAsk float64) error {
 	b.mu.Lock()
-	if _, ok := b.triggered[level]; ok {
+	var triggered map[float64]struct{}
+	if tradeSide == "NO" {
+		triggered = b.triggeredNo
+	} else {
+		triggered = b.triggeredYes
+	}
+	if _, ok := triggered[level]; ok {
 		b.mu.Unlock()
 		return nil
 	}
-	b.triggered[level] = struct{}{}
-	tradeSide := b.tradeSide
+	triggered[level] = struct{}{}
 	entrySize := b.entrySize
 	marketBuyMax := b.marketBuyMaxPrice
 	yesID, noID := b.tokenIdYes, b.tokenIdNo
-	priceYes, priceNo := b.priceYes, b.priceNo
 	b.mu.Unlock()
 
 	if yesID == "" || noID == "" {
@@ -439,13 +484,11 @@ func (b *GridHedge) onCrossUp(ctx context.Context, level float64) error {
 	// 1) 市价买入 tradeSide（FOK + 0.99）
 	entryToken := yesID
 	entryLabel := "YES"
-	entryAsk := priceYes
 	hedgeToken := noID
 	hedgeLabel := "NO"
 	if tradeSide == "NO" {
 		entryToken = noID
 		entryLabel = "NO"
-		entryAsk = priceNo
 		hedgeToken = yesID
 		hedgeLabel = "YES"
 	}
@@ -560,23 +603,23 @@ func (b *GridHedge) recordFill(side string, price float64, size float64) {
 	b.avgCostNo += price * size
 }
 
-func (b *GridHedge) updatePrices(data any) {
+func (b *GridHedge) updatePrices(data any) (assetID string, bestAsk float64) {
 	m, ok := data.(map[string]any)
 	if !ok {
-		return
+		return "", 0
 	}
 	asks, _ := m["asks"].([]any)
-	assetID := fmt.Sprint(m["asset_id"])
+	assetID = fmt.Sprint(m["asset_id"])
 	if assetID == "" || len(asks) == 0 {
-		return
+		return "", 0
 	}
 	first, _ := asks[0].(map[string]any)
 	if first == nil {
-		return
+		return "", 0
 	}
 	p := parseFloat(fmt.Sprint(first["price"]))
 	if p <= 0 {
-		return
+		return "", 0
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -586,6 +629,7 @@ func (b *GridHedge) updatePrices(data any) {
 	if assetID == b.tokenIdNo {
 		b.priceNo = p
 	}
+	return assetID, p
 }
 
 func (b *GridHedge) checkFills(ctx context.Context) error {
@@ -819,4 +863,29 @@ func clamp01(v float64) float64 {
 	}
 	// 保留两位小数（与其他策略一致的“报价粒度”）
 	return math.Floor(v*100) / 100
+}
+
+func parseTradeSides(s string) map[string]bool {
+	out := map[string]bool{"YES": false, "NO": false}
+	u := strings.ToUpper(strings.TrimSpace(s))
+	if u == "" {
+		return map[string]bool{"YES": true, "NO": true}
+	}
+	if u == "BOTH" || u == "ANY" || u == "YES+NO" || u == "YES/NO" {
+		return map[string]bool{"YES": true, "NO": true}
+	}
+	for _, part := range strings.Split(u, ",") {
+		part = strings.TrimSpace(part)
+		if part == "YES" {
+			out["YES"] = true
+		}
+		if part == "NO" {
+			out["NO"] = true
+		}
+	}
+	// 兜底：解析失败则默认 BOTH
+	if !out["YES"] && !out["NO"] {
+		return map[string]bool{"YES": true, "NO": true}
+	}
+	return out
 }
